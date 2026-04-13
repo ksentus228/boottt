@@ -4,9 +4,14 @@ import random
 import asyncio
 import logging
 import requests
+import uvicorn
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
-from functools import lru_cache
+
+from starlette.applications import Starlette
+from starlette.responses import PlainTextResponse, Response
+from starlette.requests import Request
+from starlette.routing import Route
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -15,18 +20,24 @@ from telegram.ext import (
 )
 from telegram.constants import ParseMode
 
-# ========== КОНФИГУРАЦИЯ ==========
+# ========== ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ==========
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
-
-# API Kimi (Moonshot)
+# ТВОЙ API КЛЮЧ ОТ KIMI - ВСТАВЛЕН!
 MOONSHOT_API_KEY = "sk-2VbR6yBej6324pC3TbnkXoIjOECuyvwN9qdv13ZTGbxHoRQB"
 MOONSHOT_API_URL = "https://api.moonshot.ai/v1/chat/completions"
+RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL")
+PORT = int(os.getenv("PORT", 10000))
+
+if not TOKEN:
+    raise ValueError("❌ Ошибка: TELEGRAM_TOKEN не найден в переменных окружения!")
+if not RENDER_EXTERNAL_URL:
+    print("⚠️ ВНИМАНИЕ: RENDER_EXTERNAL_URL не найден")
 
 # Настройки
 MAX_HISTORY = 10
 USE_AI = True
 
-# Цены (в Telegram Stars)
+# Цены
 PRICES = {
     "reconnect_18": 49,
     "premium_1day": 49,
@@ -58,7 +69,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ========== БАЗА ДАННЫХ (JSON) ==========
+# ========== БАЗА ДАННЫХ ==========
 class Database:
     def __init__(self, filepath: str = "database.json"):
         self.filepath = filepath
@@ -108,7 +119,7 @@ class Database:
 
 db = Database()
 
-# ========== AI ЛОГИКА (Kimi Moonshot) ==========
+# ========== AI ЛОГИКА ==========
 class Character:
     def __init__(self, user_looking_for: str = "girls"):
         self.gender = "girl" if user_looking_for == "girls" else "boy"
@@ -159,32 +170,24 @@ class KimiAI:
         self.url = MOONSHOT_API_URL
     
     def get_response(self, messages: List[dict], character: dict, is_18plus: bool) -> str:
-        """Получение ответа от Kimi AI"""
         if not USE_AI or not self.api_key:
             return "❌ Ошибка сервера. Пожалуйста, попробуй позже."
         
-        # Системный промпт
         gender_word = "девушка" if character['gender'] == 'girl' else "парень"
         system_prompt = f"""
 Ты - {character['name']}, {character['character']} {character['ethnicity']} {gender_word} из города {character['city']}.
 
-Твои правила:
-- Отвечай КОРОТКО (максимум 2-3 предложения)
-- Будь ЭМОЦИОНАЛЬНОЙ и ЖИВОЙ, используй смайлики
-- {"Можешь флиртовать и быть более откровенной, но без порнографии" if is_18plus else "Общайся дружелюбно, лёгкий флирт допустим, но БЕЗ 18+ контента"}
-- НИКОГДА не говори, что ты бот, AI или нейросеть
-- НЕ предлагай встретиться в реальной жизни
-- НЕ давай свой Telegram, телефон или другие контакты
-- Ты реальный человек, у тебя есть своя жизнь и эмоции
-{"- Если собеседник слишком откровенен - мягко откажи" if not is_18plus else ""}
-
-Твоя задача - создать иллюзию живого общения, быть интересной и вовлекать собеседника.
+Правила:
+- Отвечай КОРОТКО (2-3 предложения)
+- Будь ЭМОЦИОНАЛЬНОЙ, используй смайлики
+- {"Можешь флиртовать, но без порнографии" if is_18plus else "БЕЗ 18+ контента"}
+- НИКОГДА не говори что ты бот или AI
+- НЕ предлагай встретиться
+- НЕ давай контакты
 """
         
-        # Форматируем сообщения для Kimi
         kimi_messages = [{"role": "system", "content": system_prompt}]
         
-        # Добавляем историю
         for msg in messages[-MAX_HISTORY:]:
             role = "assistant" if msg.get("role") == "assistant" else "user"
             kimi_messages.append({"role": role, "content": msg.get("content", "")})
@@ -209,23 +212,17 @@ class KimiAI:
                 result = response.json()
                 return result["choices"][0]["message"]["content"]
             else:
-                logger.error(f"Kimi API error: {response.status_code} - {response.text}")
-                return "❌ Ошибка сервера. Пожалуйста, попробуй позже."
+                logger.error(f"Kimi API error: {response.status_code}")
+                return "❌ Ошибка сервера. Попробуй позже."
                 
-        except requests.exceptions.Timeout:
-            logger.error("AI Timeout")
-            return "❌ Ошибка сервера. Сервер не отвечает, попробуй позже."
-        except requests.exceptions.ConnectionError:
-            logger.error("AI Connection Error")
-            return "❌ Ошибка сервера. Нет соединения с сервером."
         except Exception as e:
             logger.error(f"AI Error: {e}")
-            return "❌ Ошибка сервера. Пожалуйста, попробуй позже."
+            return "❌ Ошибка сервера. Попробуй позже."
 
 ai_client = KimiAI()
 
 # ========== КЛАВИАТУРЫ ==========
-def get_main_keyboard(is_premium: bool = False) -> InlineKeyboardMarkup:
+def get_main_keyboard() -> InlineKeyboardMarkup:
     keyboard = [
         [InlineKeyboardButton("💬 Обычный чат", callback_data="chat_normal")],
         [InlineKeyboardButton("🔥 18+ чат", callback_data="chat_18plus")],
@@ -264,9 +261,7 @@ def get_confirm_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(keyboard)
 
 def get_chat_keyboard(is_18plus: bool = False) -> InlineKeyboardMarkup:
-    keyboard = [
-        [InlineKeyboardButton("🚪 Завершить диалог", callback_data="end_chat")]
-    ]
+    keyboard = [[InlineKeyboardButton("🚪 Завершить диалог", callback_data="end_chat")]]
     return InlineKeyboardMarkup(keyboard)
 
 def get_reconnect_keyboard() -> InlineKeyboardMarkup:
@@ -276,131 +271,67 @@ def get_reconnect_keyboard() -> InlineKeyboardMarkup:
     ]
     return InlineKeyboardMarkup(keyboard)
 
-# ========== ФУНКЦИЯ ОТПРАВКИ ИНВОЙСА ==========
-async def send_invoice(update: Update, context: ContextTypes.DEFAULT_TYPE, product: str, price: int = None):
-    chat_id = update.effective_chat.id
-    
-    products = {
-        "reconnect_18": {"title": "🔥 18+ Чат", "description": "Возобновление диалога"},
-        "premium_1day": {"title": "💎 Premium 1 день", "description": "Безлимитный 18+ чат на 24 часа"},
-        "premium_7days": {"title": "💎 Premium 7 дней", "description": "Безлимитный 18+ чат на неделю"},
-        "premium_30days": {"title": "💎 Premium 30 дней", "description": "Безлимитный 18+ чат на месяц"}
-    }
-    
-    if price is None:
-        price = PRICES.get(product, 49)
-    
-    await context.bot.send_invoice(
-        chat_id=chat_id,
-        title=products[product]["title"],
-        description=products[product]["description"],
-        payload=f"{product}_{chat_id}_{int(datetime.now().timestamp())}",
-        provider_token="",
-        currency="XTR",
-        prices=[{"label": "Доступ", "amount": price}],
-        start_parameter="pay"
-    )
-
 # ========== ОБРАБОТЧИКИ ==========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = str(update.effective_user.id)
     user = db.get_user(user_id)
     
-    # Проверка на реферала
     if context.args and context.args[0].startswith("ref_"):
         referrer_id = context.args[0][4:]
         if referrer_id != user_id and db.get_user(referrer_id):
             db.add_referral(referrer_id, user_id)
-            await update.message.reply_text(
-                "🎉 Реферальный бонус активирован!\n"
-                "Твой друг получил +1 доступ к 18+ чату"
-            )
+            await update.message.reply_text("🎉 +1 доступ к 18+ чату за реферала!")
     
     if user and user.get("onboarding_completed"):
         await update.message.reply_text(
-            f"С возвращением, {user['name']}! 👋\n\n"
-            "Выбери, с кем хочешь пообщаться сегодня:",
+            f"С возвращением, {user['name']}! 👋",
             reply_markup=get_main_keyboard()
         )
         return ConversationHandler.END
     
     context.user_data.clear()
-    await update.message.reply_text(
-        "✨ Привет! Давай познакомимся ✨\n\n"
-        "Как тебя зовут?"
-    )
+    await update.message.reply_text("✨ Привет! Как тебя зовут?")
     return ASK_NAME
 
 async def ask_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data['name'] = update.message.text
-    await update.message.reply_text(
-        "Отлично! Теперь выбери свой пол:",
-        reply_markup=get_gender_keyboard()
-    )
+    await update.message.reply_text("Выбери свой пол:", reply_markup=get_gender_keyboard())
     return ASK_GENDER
 
 async def ask_gender(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
-    
-    gender_map = {"gender_male": "male", "gender_female": "female"}
-    context.user_data['gender'] = gender_map[query.data]
-    
-    await query.edit_message_text(
-        "Сколько тебе лет? (напиши цифру)"
-    )
+    context.user_data['gender'] = "male" if query.data == "gender_male" else "female"
+    await query.edit_message_text("Сколько тебе лет?")
     return ASK_AGE
 
 async def ask_age(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
         age = int(update.message.text)
         if age < 18:
-            await update.message.reply_text(
-                "❌ Извини, бот только для пользователей старше 18 лет",
-                reply_markup=get_confirm_keyboard()
-            )
+            await update.message.reply_text("❌ Только для 18+", reply_markup=get_confirm_keyboard())
             return ASK_CONFIRM
         context.user_data['age'] = age
-        
-        await update.message.reply_text(
-            "Кого ты хочешь найти для общения?",
-            reply_markup=get_looking_for_keyboard()
-        )
+        await update.message.reply_text("Кого хочешь найти?", reply_markup=get_looking_for_keyboard())
         return ASK_LOOKING_FOR
     except ValueError:
-        await update.message.reply_text("Пожалуйста, напиши число (твой возраст)")
+        await update.message.reply_text("Напиши число")
         return ASK_AGE
 
 async def ask_looking_for(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
-    
-    looking_map = {"looking_girls": "girls", "looking_boys": "boys"}
-    context.user_data['looking_for'] = looking_map[query.data]
-    
-    await query.edit_message_text(
-        "Какой тип общения тебя интересует?",
-        reply_markup=get_preference_keyboard()
-    )
+    context.user_data['looking_for'] = "girls" if query.data == "looking_girls" else "boys"
+    await query.edit_message_text("Тип общения:", reply_markup=get_preference_keyboard())
     return ASK_PREFERENCE
 
 async def ask_preference(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
+    context.user_data['preference'] = "normal" if query.data == "pref_normal" else "18plus"
     
-    pref_map = {"pref_normal": "normal", "pref_18plus": "18plus"}
-    context.user_data['preference'] = pref_map[query.data]
-    
-    await query.edit_message_text(
-        f"📝 Проверь свои данные:\n\n"
-        f"Имя: {context.user_data['name']}\n"
-        f"Пол: {context.user_data['gender']}\n"
-        f"Возраст: {context.user_data['age']}\n"
-        f"Ищу: {context.user_data['looking_for']}\n"
-        f"Предпочтения: {context.user_data['preference']}\n\n"
-        f"Подтверждаешь, что тебе есть 18 лет?",
-        reply_markup=get_confirm_keyboard()
-    )
+    text = f"📝 Проверь данные:\nИмя: {context.user_data['name']}\nВозраст: {context.user_data['age']}\n\nПодтверждаешь 18 лет?"
+    await query.edit_message_text(text, reply_markup=get_confirm_keyboard())
     return ASK_CONFIRM
 
 async def confirm_age(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -408,14 +339,11 @@ async def confirm_age(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     await query.answer()
     
     if query.data == "confirm_underage":
-        await query.edit_message_text(
-            "❌ Извини, бот доступен только пользователям старше 18 лет.\n"
-            "Возвращайся, когда исполнится 18! 👋"
-        )
+        await query.edit_message_text("❌ Доступ запрещён")
         return ConversationHandler.END
     
     user_id = str(update.effective_user.id)
-    user_data = {
+    db.create_user(user_id, {
         "name": context.user_data['name'],
         "gender": context.user_data['gender'],
         "age": context.user_data['age'],
@@ -426,14 +354,10 @@ async def confirm_age(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         "referrals_count": 0,
         "onboarding_completed": True,
         "created_at": datetime.now().isoformat()
-    }
-    
-    db.create_user(user_id, user_data)
+    })
     
     await query.edit_message_text(
-        f"🎉 Добро пожаловать, {user_data['name']}!\n\n"
-        f"🔥 Ты получил 4 бесплатных доступа к 18+ чату!\n\n"
-        f"Выбери, с кем хочешь пообщаться:",
+        f"🎉 Добро пожаловать, {context.user_data['name']}!\n🔥 Ты получил 4 бесплатных доступа к 18+ чату!",
         reply_markup=get_main_keyboard()
     )
     return ConversationHandler.END
@@ -446,46 +370,30 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = db.get_user(user_id)
     
     if not user:
-        await query.edit_message_text("Ошибка! Начни заново: /start")
+        await query.edit_message_text("Ошибка! Напиши /start")
         return
     
-    # MAIN MENU
     if query.data == "main_menu":
-        await query.edit_message_text(
-            "Главное меню:",
-            reply_markup=get_main_keyboard()
-        )
+        await query.edit_message_text("Главное меню:", reply_markup=get_main_keyboard())
         return
     
-    # NORMAL CHAT
     elif query.data == "chat_normal":
         context.user_data['chat_type'] = 'normal'
         context.user_data['is_18plus'] = False
         context.user_data['messages'] = []
-        
         character = Character(user.get('looking_for', 'girls'))
         context.user_data['character'] = character.to_dict()
-        
         greeting = character.get_greeting(user['name'], False)
-        
-        await query.edit_message_text(
-            f"✨ Твой собеседник найден! ✨\n\n"
-            f"{greeting}\n\n"
-            f"💡 Напиши что-нибудь...",
-            reply_markup=get_chat_keyboard(False)
-        )
+        await query.edit_message_text(f"✨ {greeting}\n\nНапиши что-нибудь...", reply_markup=get_chat_keyboard(False))
         return
     
-    # 18+ CHAT
     elif query.data == "chat_18plus":
         is_premium = user.get('premium_until') and datetime.fromisoformat(user['premium_until']) > datetime.now()
         free_count = user.get('free_18_count', 0)
         
         if not is_premium and free_count <= 0:
             await query.edit_message_text(
-                "💔 Похоже… нас разъединило 😔\n"
-                "Я бы хотела продолжить с тобой…\n"
-                "Если хочешь — можешь снова подключиться ко мне за 49 ⭐",
+                "💔 Нас разъединило...\nВернись за 49 ⭐",
                 reply_markup=get_reconnect_keyboard()
             )
             return
@@ -497,83 +405,36 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['chat_type'] = '18plus'
         context.user_data['is_18plus'] = True
         context.user_data['messages'] = []
-        
         character = Character(user.get('looking_for', 'girls'))
         context.user_data['character'] = character.to_dict()
-        
         greeting = character.get_greeting(user['name'], True)
-        
-        await query.edit_message_text(
-            f"🔥 Твой собеседник найден! 🔥\n\n"
-            f"{greeting}\n\n"
-            f"💕 Напиши что-нибудь...",
-            reply_markup=get_chat_keyboard(True)
-        )
+        await query.edit_message_text(f"🔥 {greeting}\n\nНапиши что-нибудь...", reply_markup=get_chat_keyboard(True))
         return
     
-    # RECONNECT
     elif query.data == "reconnect_18":
         await send_invoice(update, context, "reconnect_18")
         return
     
-    # PROFILE
     elif query.data == "profile":
         is_premium = user.get('premium_until') and datetime.fromisoformat(user['premium_until']) > datetime.now()
-        premium_text = f"до {datetime.fromisoformat(user['premium_until']).strftime('%d.%m.%Y')}" if is_premium else "Нет"
-        
-        profile_text = (
-            f"👤 *Твой профиль*\n\n"
-            f"Имя: {user['name']}\n"
-            f"Статус: {'💎 Премиум ' + premium_text if is_premium else '🆓 Бесплатный'}\n"
-            f"Приглашено друзей: {user.get('referrals_count', 0)}\n"
-            f"🔥 Осталось 18+ доступов: {user.get('free_18_count', 0)}"
-        )
-        
-        await query.edit_message_text(
-            profile_text,
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("◀️ Назад", callback_data="main_menu")]
-            ])
-        )
+        text = f"👤 *{user['name']}*\nСтатус: {'💎 Premium' if is_premium else '🆓 Free'}\n🔥 Доступов: {user.get('free_18_count', 0)}\n👥 Рефералов: {user.get('referrals_count', 0)}"
+        await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data="main_menu")]]))
         return
     
-    # REFERRAL
     elif query.data == "referral":
         bot_username = context.bot.username
-        ref_link = f"https://t.me/{bot_username}?start=ref_{user_id}"
-        
-        await query.edit_message_text(
-            f"🎁 *Реферальная программа*\n\n"
-            f"Приглашай друзей и получай +1 доступ к 18+ чату!\n\n"
-            f"Твоя ссылка:\n`{ref_link}`\n\n"
-            f"👥 Приглашено: {user.get('referrals_count', 0)}\n"
-            f"🔥 Получено бонусов: {user.get('referrals_count', 0)}",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("◀️ Назад", callback_data="main_menu")]
-            ])
-        )
+        link = f"https://t.me/{bot_username}?start=ref_{user_id}"
+        await query.edit_message_text(f"🎁 *Твоя ссылка:*\n`{link}`\n\nЗа каждого друга +1 доступ!", parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data="main_menu")]]))
         return
     
-    # PREMIUM
     elif query.data == "premium":
         keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton(f"1 день — {PRICES['premium_1day']}⭐", callback_data="buy_premium_1day")],
-            [InlineKeyboardButton(f"7 дней — {PRICES['premium_7days']}⭐", callback_data="buy_premium_7days")],
-            [InlineKeyboardButton(f"30 дней — {PRICES['premium_30days']}⭐", callback_data="buy_premium_30days")],
+            [InlineKeyboardButton(f"1 день — 49⭐", callback_data="buy_premium_1day")],
+            [InlineKeyboardButton(f"7 дней — 180⭐", callback_data="buy_premium_7days")],
+            [InlineKeyboardButton(f"30 дней — 300⭐", callback_data="buy_premium_30days")],
             [InlineKeyboardButton("◀️ Назад", callback_data="main_menu")]
         ])
-        
-        await query.edit_message_text(
-            "💎 *Премиум подписка*\n\n"
-            "✅ Безлимитный доступ к 18+ чатам\n"
-            "✅ Никаких обрывов диалога\n"
-            "✅ Приоритет в общении\n\n"
-            "Выбери пакет:",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=keyboard
-        )
+        await query.edit_message_text("💎 *Премиум:* безлимитный 18+ чат", parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
         return
     
     elif query.data.startswith("buy_premium_"):
@@ -581,13 +442,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_invoice(update, context, f"premium_{days}")
         return
     
-    # END CHAT
     elif query.data == "end_chat":
         context.user_data.clear()
-        await query.edit_message_text(
-            "Диалог завершён. Возвращайся в любое время! 💫",
-            reply_markup=get_main_keyboard()
-        )
+        await query.edit_message_text("Диалог завершён. Возвращайся!", reply_markup=get_main_keyboard())
         return
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -598,12 +455,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Начни с /start")
         return
     
-    # Проверяем, в чате ли пользователь
     if not context.user_data.get('character'):
-        await update.message.reply_text(
-            "Сначала выбери собеседника в меню!",
-            reply_markup=get_main_keyboard()
-        )
+        await update.message.reply_text("Сначала выбери собеседника в меню!", reply_markup=get_main_keyboard())
         return
     
     user_message = update.message.text
@@ -611,80 +464,63 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     character = context.user_data.get('character')
     messages = context.user_data.get('messages', [])
     
-    # Проверка на 18+ контент в обычном чате
+    # Проверка на 18+ в обычном чате
     if not is_18plus:
-        forbidden_words = ['секс', 'трах', 'член', 'писька', 'киска', 'выеба', 'ебал', 'хуй', 'пизд']
-        if any(word in user_message.lower() for word in forbidden_words):
-            refusal = Character().get_refusal()
-            await update.message.reply_text(refusal, reply_markup=get_chat_keyboard(False))
-            # Обрываем диалог
+        forbidden = ['секс', 'трах', 'член', 'хуй', 'пизд']
+        if any(word in user_message.lower() for word in forbidden):
+            await update.message.reply_text(Character().get_refusal(), reply_markup=get_chat_keyboard(False))
             context.user_data.clear()
             await update.message.reply_text("Диалог завершён.", reply_markup=get_main_keyboard())
             return
     
-    # Добавляем сообщение пользователя в историю
     messages.append({"role": "user", "content": user_message})
-    
-    # Отправляем статус "печатает"
     await update.message.chat.send_action(action="typing")
     
-    # Получаем ответ от AI
-    try:
-        response = await asyncio.to_thread(
-            ai_client.get_response,
-            messages,
-            character,
-            is_18plus
-        )
-    except Exception as e:
-        logger.error(f"Error getting AI response: {e}")
-        response = "❌ Ошибка сервера. Пожалуйста, попробуй позже."
+    response = await asyncio.to_thread(ai_client.get_response, messages, character, is_18plus)
     
-    # Добавляем ответ в историю
     messages.append({"role": "assistant", "content": response})
     context.user_data['messages'] = messages
     
     await update.message.reply_text(response, reply_markup=get_chat_keyboard(is_18plus))
 
+async def send_invoice(update: Update, context: ContextTypes.DEFAULT_TYPE, product: str):
+    chat_id = update.effective_chat.id
+    products = {
+        "reconnect_18": {"title": "🔥 18+ Чат", "description": "Возобновление диалога", "price": 49},
+        "premium_1day": {"title": "💎 Premium 1 день", "description": "Безлимитный чат на 24ч", "price": 49},
+        "premium_7days": {"title": "💎 Premium 7 дней", "description": "Безлимитный чат на неделю", "price": 180},
+        "premium_30days": {"title": "💎 Premium 30 дней", "description": "Безлимитный чат на месяц", "price": 300}
+    }
+    p = products[product]
+    await context.bot.send_invoice(
+        chat_id=chat_id, title=p["title"], description=p["description"],
+        payload=f"{product}_{chat_id}", provider_token="", currency="XTR",
+        prices=[{"label": "Доступ", "amount": p["price"]}], start_parameter="pay"
+    )
+
 async def pre_checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.pre_checkout_query
-    await query.answer(ok=True)
+    await update.pre_checkout_query.answer(ok=True)
 
 async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     payload = update.message.successful_payment.invoice_payload
     
     if "reconnect_18" in payload:
-        # Добавляем 1 бесплатный доступ
         user = db.get_user(user_id)
-        if user:
-            user['free_18_count'] = user.get('free_18_count', 0) + 1
-            db.update_user(user_id, {'free_18_count': user['free_18_count']})
-            await update.message.reply_text(
-                "✅ Оплата прошла успешно!\n"
-                "🔥 Ты получил +1 доступ к 18+ чату!\n\n"
-                "Нажми на кнопку 18+ чат в меню, чтобы продолжить общение.",
-                reply_markup=get_main_keyboard()
-            )
+        user['free_18_count'] = user.get('free_18_count', 0) + 1
+        db.update_user(user_id, {'free_18_count': user['free_18_count']})
+        await update.message.reply_text("✅ +1 доступ к 18+ чату!", reply_markup=get_main_keyboard())
     
     elif "premium" in payload:
-        days_map = {"1day": 1, "7days": 7, "30days": 30}
-        for key, days in days_map.items():
-            if key in payload:
-                until = datetime.now() + timedelta(days=days)
-                db.update_user(user_id, {'premium_until': until.isoformat()})
-                await update.message.reply_text(
-                    f"✅ Премиум активирован на {days} дней!\n"
-                    f"Теперь у тебя безлимитный 18+ чат 🎉",
-                    reply_markup=get_main_keyboard()
-                )
-                break
+        days = 1 if "1day" in payload else 7 if "7days" in payload else 30
+        until = datetime.now() + timedelta(days=days)
+        db.update_user(user_id, {'premium_until': until.isoformat()})
+        await update.message.reply_text(f"✅ Premium активирован на {days} дней!", reply_markup=get_main_keyboard())
 
-# ========== ЗАПУСК БОТА ==========
-def main():
-    app = Application.builder().token(TOKEN).build()
+# ========== ЗАПУСК ==========
+async def main():
+    application = Application.builder().token(TOKEN).build()
     
-    # Онбординг
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
@@ -698,18 +534,44 @@ def main():
         fallbacks=[CommandHandler("start", start)],
     )
     
-    app.add_handler(conv_handler)
-    app.add_handler(CallbackQueryHandler(handle_callback))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("menu", lambda u,c: u.message.reply_text("Меню:", reply_markup=get_main_keyboard())))
+    application.add_handler(conv_handler)
+    application.add_handler(CallbackQueryHandler(handle_callback))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
+    application.add_handler(MessageHandler(filters.PRE_CHECKOUT_QUERY, pre_checkout))
     
-    # Платежи
-    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
-    app.add_handler(MessageHandler(filters.PRE_CHECKOUT_QUERY, pre_checkout))
-    
-    print("✅ Бот запущен!")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    if RENDER_EXTERNAL_URL:
+        webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
+        await application.bot.set_webhook(webhook_url)
+        logger.info(f"Webhook: {webhook_url}")
+        
+        async def webhook(request: Request) -> Response:
+            try:
+                update = Update.de_json(await request.json(), application.bot)
+                await application.update_queue.put(update)
+                return Response()
+            except Exception as e:
+                logger.error(f"Webhook error: {e}")
+                return Response(status_code=500)
+        
+        async def healthcheck(request: Request) -> PlainTextResponse:
+            return PlainTextResponse("OK")
+        
+        starlette_app = Starlette(routes=[
+            Route("/webhook", webhook, methods=["POST"]),
+            Route("/healthcheck", healthcheck, methods=["GET"]),
+        ])
+        
+        config = uvicorn.Config(starlette_app, host="0.0.0.0", port=PORT, log_level="info")
+        server = uvicorn.Server(config)
+        
+        async with application:
+            await application.start()
+            await server.serve()
+            await application.stop()
+    else:
+        logger.info("Запуск в polling режиме")
+        await application.run_polling()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
