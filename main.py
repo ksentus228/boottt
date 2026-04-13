@@ -16,7 +16,7 @@ from telegram.ext import (
 from telegram.constants import ParseMode
 
 # ========== КОНФИГУРАЦИЯ ==========
-TOKEN = "ТВОЙ_TELEGRAM_БОТ_ТОКЕН"  # Вставь сюда токен бота от @BotFather
+TOKEN = os.environ.get("TELEGRAM_TOKEN")"  # Вставь сюда токен бота от @BotFather
 
 # API Kimi (Moonshot)
 MOONSHOT_API_KEY = "sk-2VbR6yBej6324pC3TbnkXoIjOECuyvwN9qdv13ZTGbxHoRQB"
